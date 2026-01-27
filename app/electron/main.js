@@ -40,23 +40,24 @@ const isDevEnv = process.env.NODE_ENV === "development";
 const appVer = app.getVersion();
 const confDir = path.join(app.getPath("home"), ".config", "siyuan");
 const windowStatePath = path.join(confDir, "windowState.json");
+const remoteServerConfigPath = path.join(confDir, "remote-server.json");
 let bootWindow;
 let latestActiveWindow;
 let firstOpen = false;
 let workspaces = []; // workspaceDir, id, browserWindow, tray, hideShortcut
-let kernelPort = 6806;
 let resetWindowStateOnRestart = false;
+// 远程服务器配置
+let remoteServerConfig = {
+    host: "192.168.2.21",
+    port: 50080
+};
 
 remote.initialize();
 
-app.setPath("userData", app.getPath("userData") + "-Electron"); // `~/.config` 下 Electron 相关文件夹名称改为 `SiYuan-Electron` https://github.com/siyuan-note/siyuan/issues/3349
-fs.rmSync(app.getPath("appData") + "/" + app.name, {recursive: true}); // 删除自动创建的应用目录 https://github.com/siyuan-note/siyuan/issues/13150
+app.setPath("userData", app.getPath("userData") + "-Electron");
+fs.rmSync(app.getPath("appData") + "/" + app.name, {recursive: true, force: true});
 
-if (!app.requestSingleInstanceLock()) {
-    app.quit();
-    return;
-}
-
+// 初始化配置目录
 try {
     firstOpen = !fs.existsSync(path.join(confDir, "workspace.json"));
     if (!fs.existsSync(confDir)) {
@@ -68,13 +69,43 @@ try {
     app.exit();
 }
 
+// 加载远程服务器配置
+const loadRemoteServerConfig = () => {
+    try {
+        if (fs.existsSync(remoteServerConfigPath)) {
+            const config = JSON.parse(fs.readFileSync(remoteServerConfigPath, "utf8"));
+            if (config.host && config.port) {
+                remoteServerConfig = config;
+            }
+        }
+    } catch (e) {
+        console.error("加载远程服务器配置失败:", e);
+        // 使用默认配置并保存
+        saveRemoteServerConfig();
+    }
+};
+
+// 保存远程服务器配置
+const saveRemoteServerConfig = () => {
+    try {
+        fs.writeFileSync(remoteServerConfigPath, JSON.stringify(remoteServerConfig, null, 2));
+    } catch (e) {
+        console.error("保存远程服务器配置失败:", e);
+        dialog.showErrorBox("保存失败", "无法保存远程服务器配置，请检查目录权限");
+    }
+};
+
+// 获取远程服务器地址
+const getRemoteServer = () => {
+    return `http://${remoteServerConfig.host}:${remoteServerConfig.port}`;
+};
+
 const windowNavigate = (currentWindow, windowType) => {
     currentWindow.webContents.on("will-navigate", (event) => {
         const url = event.url;
-        if (url.startsWith(localServer)) {
+        if (url.startsWith(getRemoteServer())) {
             try {
                 const pathname = new URL(url).pathname;
-                // 所有窗口都允许认证页面
                 if (pathname === "/check-auth" || pathname === "/") {
                     return;
                 }
@@ -91,7 +122,6 @@ const windowNavigate = (currentWindow, windowType) => {
                 return;
             }
         }
-        // 其他链接使用浏览器打开
         event.preventDefault();
         shell.openExternal(url);
     });
@@ -173,24 +203,21 @@ const resolveAppLanguage = (languageTags) => {
     return languageMapping[language] || "en_US";
 };
 
-const exitApp = (port, errorWindowId) => {
+const exitApp = (errorWindowId) => {
     let tray;
     let mainWindow;
 
-    // 关闭端口相同的所有非主窗口
     BrowserWindow.getAllWindows().forEach((item) => {
         try {
             const currentURL = new URL(item.getURL());
-            if (port.toString() === currentURL.port.toString()) {
-                const hasMain = workspaces.find((workspaceItem) => {
-                    if (workspaceItem.browserWindow.id === item.id) {
-                        mainWindow = item;
-                        return true;
-                    }
-                });
-                if (!hasMain) {
-                    item.destroy();
+            const hasMain = workspaces.find((workspaceItem) => {
+                if (workspaceItem.browserWindow.id === item.id) {
+                    mainWindow = item;
+                    return true;
                 }
+            });
+            if (!hasMain) {
+                item.destroy();
             }
         } catch (e) {
             // load file is not a url
@@ -243,12 +270,6 @@ const exitApp = (port, errorWindowId) => {
     }
 };
 
-const localServer = "http://127.0.0.1";
-
-const getServer = (port = kernelPort) => {
-    return localServer + ":" + port;
-};
-
 const sleep = (ms) => {
     return new Promise(resolve => setTimeout(resolve, ms));
 };
@@ -265,7 +286,7 @@ const showErrorWindow = (titleZh, titleEn, content, emoji = "⚠️") => {
         titleBarStyle: "hidden",
         fullscreenable: false,
         icon: path.join(appDir, "stage", "icon-large.png"),
-        transparent: "darwin" === process.platform, // 避免深色模式关闭窗口时闪现白色背景
+        transparent: "darwin" === process.platform,
         webPreferences: {
             nodeIntegration: true, webviewTag: true, webSecurity: false, contextIsolation: false,
         },
@@ -282,6 +303,115 @@ const showErrorWindow = (titleZh, titleEn, content, emoji = "⚠️") => {
     });
     errWindow.show();
     return errWindow.id;
+};
+
+// 创建远程服务器配置窗口
+const createConfigWindow = () => {
+    const configWindow = new BrowserWindow({
+        width: 400,
+        height: 300,
+        resizable: false,
+        frame: true,
+        title: "远程服务器配置",
+        webPreferences: {
+            nodeIntegration: true,
+            contextIsolation: false,
+            webSecurity: false
+        }
+    });
+
+    // 内嵌配置页面
+    const configHTML = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>远程服务器配置</title>
+            <style>
+                body { padding: 20px; font-family: Arial; }
+                .form-group { margin-bottom: 15px; }
+                label { display: block; margin-bottom: 5px; }
+                input { width: 90%; padding: 8px; }
+                .btn-group { margin-top: 20px; }
+                button { padding: 8px 15px; margin-right: 10px; cursor: pointer; }
+                #status { margin-top: 15px; color: green; }
+                .error { color: red; }
+            </style>
+        </head>
+        <body>
+            <div class="form-group">
+                <label>服务器地址:</label>
+                <input type="text" id="host" value="${remoteServerConfig.host}">
+            </div>
+            <div class="form-group">
+                <label>服务器端口:</label>
+                <input type="number" id="port" value="${remoteServerConfig.port}">
+            </div>
+            <div class="btn-group">
+                <button id="testBtn">测试连接</button>
+                <button id="saveBtn">保存配置</button>
+            </div>
+            <div id="status"></div>
+
+            <script>
+                const { ipcRenderer } = require('electron');
+                
+                // 测试连接
+                document.getElementById('testBtn').addEventListener('click', async () => {
+                    const host = document.getElementById('host').value;
+                    const port = document.getElementById('port').value;
+                    const status = document.getElementById('status');
+                    
+                    if (!host || !port) {
+                        status.textContent = '请填写完整的服务器地址和端口';
+                        status.className = 'error';
+                        return;
+                    }
+                    
+                    status.textContent = '正在测试连接...';
+                    status.className = '';
+                    
+                    try {
+                        const response = await ipcRenderer.invoke('test-remote-connection', { host, port });
+                        status.textContent = \`连接成功，服务端版本: \${response.version}\`;
+                        status.className = '';
+                    } catch (e) {
+                        status.textContent = \`连接失败: \${e.message}\`;
+                        status.className = 'error';
+                    }
+                });
+                
+                // 保存配置
+                document.getElementById('saveBtn').addEventListener('click', () => {
+                    const host = document.getElementById('host').value;
+                    const port = document.getElementById('port').value;
+                    const status = document.getElementById('status');
+                    
+                    if (!host || !port) {
+                        status.textContent = '请填写完整的服务器地址和端口';
+                        status.className = 'error';
+                        return;
+                    }
+                    
+                    ipcRenderer.invoke('save-remote-config', { host, port })
+                        .then(() => {
+                            status.textContent = '配置保存成功';
+                            status.className = '';
+                        })
+                        .catch(e => {
+                            status.textContent = \`保存失败: \${e.message}\`;
+                            status.className = 'error';
+                        });
+                });
+            </script>
+        </body>
+        </html>
+    `;
+
+    // 加载内嵌HTML
+    configWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(configHTML)}`);
+    configWindow.setMenu(null);
+    return configWindow;
 };
 
 const writeLog = (out) => {
@@ -355,10 +485,7 @@ const initMainWindow = () => {
         y = 0;
     }
     if (workArea) {
-        // 窗口大于 workArea 时缩小会隐藏到左下角，这里使用最小值重置
         if (windowState.width > workArea.width + 32 || windowState.height > workArea.height + 32) {
-            // 重启后窗口大小恢复默认问题 https://github.com/siyuan-note/siyuan/issues/7755 https://github.com/siyuan-note/siyuan/issues/13732
-            // 这里 +32 是因为在某种情况下窗口大小会比 workArea 大几个像素导致恢复默认，+32 可以避免这种特殊情况
             windowState.width = Math.min(defaultWidth, workArea.width);
             windowState.height = Math.min(defaultHeight, workArea.height);
             writeLog("reset window size [width=" + windowState.width + ", height=" + windowState.height + "]");
@@ -394,13 +521,13 @@ const initMainWindow = () => {
         fullscreenable: true,
         fullscreen: windowState.fullscreen,
         trafficLightPosition: {x: 8, y: 8},
-        transparent: "darwin" === process.platform, // 避免缩放窗口时出现边框
+        transparent: "darwin" === process.platform,
         webPreferences: {
             nodeIntegration: true,
             webviewTag: true,
             webSecurity: false,
             contextIsolation: false,
-            autoplayPolicy: "user-gesture-required" // 桌面端禁止自动播放多媒体 https://github.com/siyuan-note/siyuan/issues/7587
+            autoplayPolicy: "user-gesture-required"
         },
         frame: "darwin" === process.platform,
         titleBarStyle: "hidden",
@@ -416,26 +543,32 @@ const initMainWindow = () => {
     }
     currentWindow.webContents.userAgent = "SiYuan/" + appVer + " https://b3log.org/siyuan Electron " + currentWindow.webContents.userAgent;
 
-    // set proxy
-    net.fetch(getServer() + "/api/system/getNetwork", {method: "POST"}).then((response) => {
+    // 设置代理（如果有）
+    net.fetch(getRemoteServer() + "/api/system/getNetwork", {method: "POST"}).then((response) => {
         return response.json();
     }).then((response) => {
-        setProxy(`${response.data.proxy.scheme}://${response.data.proxy.host}:${response.data.proxy.port}`, currentWindow.webContents).then(() => {
-            // 加载主界面
-            currentWindow.loadURL(getServer() + "/stage/build/app/?v=" + new Date().getTime());
-        });
+        if (response.data?.proxy) {
+            const proxyURL = `${response.data.proxy.scheme}://${response.data.proxy.host}:${response.data.proxy.port}`;
+            setProxy(proxyURL, currentWindow.webContents);
+        }
+        // 加载远程服务器主界面
+        currentWindow.loadURL(`${getRemoteServer()}/stage/build/app/?v=${new Date().getTime()}`);
+    }).catch(err => {
+        console.error("加载远程服务器失败:", err);
+        // 加载失败时显示配置窗口
+        createConfigWindow();
+        // 仍加载主窗口（空页面）
+        currentWindow.loadURL(`${getRemoteServer()}/stage/build/app/?v=${new Date().getTime()}`);
     });
 
-    // 发起互联网服务请求时绕过安全策略 https://github.com/siyuan-note/siyuan/issues/5516
+    // 发起互联网服务请求时绕过安全策略
     currentWindow.webContents.session.webRequest.onBeforeSendHeaders((details, cb) => {
         if (-1 < details.url.toLowerCase().indexOf("bili")) {
-            // B 站不移除 Referer https://github.com/siyuan-note/siyuan/issues/94
             cb({requestHeaders: details.requestHeaders});
             return;
         }
 
         if (-1 < details.url.toLowerCase().indexOf("youtube")) {
-            // YouTube 设置 Referer https://github.com/siyuan-note/siyuan/issues/16319
             details.requestHeaders["Referer"] = "https://b3log.org/siyuan/";
             cb({requestHeaders: details.requestHeaders});
             return;
@@ -468,7 +601,7 @@ const initMainWindow = () => {
                 currentWindow.restore();
             }
             currentWindow.show();
-            setTimeout(() => { // 等待界面js执行完毕
+            setTimeout(() => {
                 writeLog(siyuanOpenURL);
                 currentWindow.webContents.send("siyuan-open-url", siyuanOpenURL);
             }, 2000);
@@ -491,16 +624,16 @@ const initMainWindow = () => {
                 currentWindow.unmaximize();
             }
         }
-        if (bootWindow && !bootWindow.isDestroyed()) {
-            bootWindow.destroy();
-        }
+        // 移除启动窗口逻辑
     });
 
-    // 菜单
+    // 菜单 - 新增配置服务器选项
     const productName = "SiYuan";
     const template = [{
         label: productName, submenu: [{
             label: `About ${productName}`, role: "about",
+        }, {
+            label: "配置远程服务器", click: () => createConfigWindow()
         }, {type: "separator"}, {role: "services"}, {type: "separator"}, {
             label: `Hide ${productName}`, role: "hide",
         }, {role: "hideOthers"}, {role: "unhide"}, {type: "separator"}, {
@@ -516,7 +649,7 @@ const initMainWindow = () => {
     },];
     const menu = Menu.buildFromTemplate(template);
     Menu.setApplicationMenu(menu);
-    // 当前页面链接使用浏览器打开
+    
     windowNavigate(currentWindow, "app");
     currentWindow.on("close", (event) => {
         if (currentWindow && !currentWindow.isDestroyed()) {
@@ -540,184 +673,6 @@ const showWindow = (wnd) => {
     wnd.show();
 };
 
-const initKernel = (workspace, port, lang) => {
-    return new Promise(async (resolve) => {
-        bootWindow = new BrowserWindow({
-            show: false,
-            width: Math.floor(screen.getPrimaryDisplay().size.width / 2),
-            height: Math.floor(screen.getPrimaryDisplay().workAreaSize.height / 2),
-            frame: false,
-            backgroundColor: "#1e1e1e",
-            resizable: false,
-            icon: path.join(appDir, "stage", "icon-large.png"),
-        });
-        let bootIndex = path.join(appDir, "app", "electron", "boot.html");
-        if (isDevEnv) {
-            bootIndex = path.join(appDir, "electron", "boot.html");
-        }
-        bootWindow.loadFile(bootIndex, {query: {v: appVer}});
-        if (openAsHidden) {
-            bootWindow.minimize();
-        } else {
-            bootWindow.show();
-        }
-
-        const kernelName = "win32" === process.platform ? "SiYuan-Kernel.exe" : "SiYuan-Kernel";
-        const kernelPath = path.join(appDir, "kernel", kernelName);
-        if (!fs.existsSync(kernelPath)) {
-            showErrorWindow("内核程序丢失", "Kernel program is missing", `<div>内核程序丢失，请重新安装思源，并将思源内核程序加入杀毒软件信任列表。</div><div>The kernel program is not found, please reinstall SiYuan and add SiYuan Kernel prgram into the trust list of your antivirus software.</div><div><i>${kernelPath}</i></div>`);
-            bootWindow.destroy();
-            resolve(false);
-            return;
-        }
-
-        if (!isDevEnv || workspaces.length > 0) {
-            if (port && "" !== port) {
-                kernelPort = port;
-            } else {
-                const getAvailablePort = () => {
-                    // https://gist.github.com/mikeal/1840641
-                    return new Promise((portResolve, portReject) => {
-                        const server = gNet.createServer();
-                        server.on("error", error => {
-                            writeLog(error);
-                            kernelPort = "";
-                            portReject();
-                        });
-                        server.listen(0, () => {
-                            kernelPort = server.address().port;
-                            server.close(() => portResolve(kernelPort));
-                        });
-                    });
-                };
-                await getAvailablePort();
-            }
-        }
-        writeLog("got kernel port [" + kernelPort + "]");
-        if (!kernelPort) {
-            bootWindow.destroy();
-            resolve(false);
-            return;
-        }
-        const cmds = ["--port", kernelPort, "--wd", appDir];
-        if (isDevEnv && workspaces.length === 0) {
-            cmds.push("--mode", "dev");
-        }
-        if (workspace && "" !== workspace) {
-            cmds.push("--workspace", workspace);
-        }
-        if (port && "" !== port) {
-            cmds.push("--port", port);
-        }
-        if (lang && "" !== lang) {
-            cmds.push("--lang", lang);
-        }
-        let cmd = `ui version [${appVer}], booting kernel [${kernelPath} ${cmds.join(" ")}]`;
-        writeLog(cmd);
-        if (!isDevEnv || workspaces.length > 0) {
-            const cp = require("child_process");
-            const kernelProcess = cp.spawn(kernelPath, cmds, {
-                detached: false, // 桌面端内核进程不再以游离模式拉起 https://github.com/siyuan-note/siyuan/issues/6336
-                stdio: "ignore",
-            },);
-
-            const currentKernelPort = kernelPort;
-            writeLog("booted kernel process [pid=" + kernelProcess.pid + ", port=" + kernelPort + "]");
-            kernelProcess.on("close", (code) => {
-                writeLog(`kernel [pid=${kernelProcess.pid}, port=${currentKernelPort}] exited with code [${code}]`);
-                if (0 !== code) {
-                    let errorWindowId;
-                    switch (code) {
-                        case 20:
-                            errorWindowId = showErrorWindow("数据库不可用", "The database is unavailable", "<div>无法访问数据库文件，请查看 工作空间/temp/siyuan.log 获取详细报错信息</div><div>Cannot access the database file. Please check workspace/temp/siyuan.log for detailed error information.</div>");
-                            break;
-                        case 21:
-                            errorWindowId = showErrorWindow("监听端口 " + currentKernelPort + " 失败", "Failed to listen to port " + currentKernelPort, "<div>监听 " + currentKernelPort + " 端口失败，请确保程序拥有网络权限并不受防火墙和杀毒软件阻止。</div><div>Failed to listen to port " + currentKernelPort + ", please make sure the program has network permissions and is not blocked by firewalls and antivirus software.</div>");
-                            break;
-                        case 24: // 工作空间已被锁定，尝试切换到第一个打开的工作空间
-                            if (workspaces && 0 < workspaces.length) {
-                                showWindow(workspaces[0].browserWindow);
-                            }
-
-                            errorWindowId = showErrorWindow("工作空间已被锁定", "The workspace is locked", "<div>该工作空间正在被使用，请尝试在任务管理器中结束 SiYuan-Kernel 进程或者重启操作系统后再启动思源。</div><div>The workspace is being used, please try to end the SiYuan-Kernel process in the task manager or restart the operating system and then start SiYuan.</div>");
-                            break;
-                        case 25:
-                            errorWindowId = showErrorWindow("初始化工作空间失败", "Failed to create workspace directory", "<div>工作空间文件夹权限不足，请查看 工作空间/temp/siyuan.log 获取详细报错信息</div><div>Insufficient permissions for the workspace folder. Please check workspace/temp/siyuan.log for detailed error information.</div>");
-                            break;
-                        case 26:
-                            errorWindowId = showErrorWindow("已成功避免潜在的数据损坏", "Successfully avoid potential data corruption", "<div>工作空间下的文件正在被第三方软件（比如同步网盘、杀毒软件等）打开占用，继续使用会导致数据损坏，思源内核已经安全退出。</div><div>请将工作空间移动到其他路径后再打开，停止同步盘同步工作空间，并将工作空间加入杀毒软件信任列表。如果以上步骤无法解决问题，请参考<a href=\"https://ld246.com/article/1684586140917\" target=\"_blank\">这里</a>或者<a href=\"https://ld246.com/article/1649901726096\" target=\"_blank\">发帖</a>寻求帮助。</div><div>The files in the workspace are being opened and occupied by third-party software (such as synchronized network disk, antivirus software, etc.), continuing to use it will cause data corruption, and the SiYuan Kernel is already safe shutdown.</div><div>Move the workspace to another path and open it again, stop the network disk to sync the workspace, and add the workspace to the antivirus software trust list. If the above steps do not resolve the issue, please look for help or report bugs <a href=\"https://liuyun.io/article/1686530886208\" target=\"_blank\">here</a>.</div>", "🚒");
-                            break;
-                        case 0:
-                            break;
-                        default:
-                            errorWindowId = showErrorWindow("内核因未知原因退出", "The kernel exited for unknown reasons", `<div>思源内核因未知原因退出 [code=${code}]，请尝试重启操作系统后再启动思源。如果该问题依然发生，请检查杀毒软件是否阻止思源内核启动。</div><div>SiYuan Kernel exited for unknown reasons [code=${code}], please try to reboot your operating system and then start SiYuan again. If occurs this problem still, please check your anti-virus software whether kill the SiYuan Kernel.</div>`);
-                            break;
-                    }
-
-                    exitApp(currentKernelPort, errorWindowId);
-                    bootWindow.destroy();
-                    resolve(false);
-                }
-            });
-        }
-
-        let apiData;
-        let count = 0;
-        writeLog("checking kernel version");
-        for (; ;) {
-            try {
-                const apiResult = await net.fetch(getServer() + "/api/system/version");
-                apiData = await apiResult.json();
-                bootWindow.loadURL(getServer() + "/appearance/boot/index.html");
-                break;
-            } catch (e) {
-                writeLog("get kernel version failed: " + e.message);
-                if (14 < ++count) {
-                    writeLog("get kernel ver failed");
-                    showErrorWindow("获取内核服务端口失败", "Failed to Obtain Kernel Service Port", "<div>获取内核服务端口失败，请确保程序拥有网络权限并不受防火墙和杀毒软件阻止。</div><div>Failed to obtain kernel service port. Please ensure SiYuan has network permissions and is not blocked by firewalls or antivirus software.</div>");
-                    bootWindow.destroy();
-                    resolve(false);
-                    return;
-                }
-                await sleep(500);
-            }
-        }
-
-        if (0 === apiData.code) {
-            writeLog("got kernel version [" + apiData.data + "]");
-            if (!isDevEnv && apiData.data !== appVer) {
-                writeLog(`kernel [${apiData.data}] is running, shutdown it now and then start kernel [${appVer}]`);
-                net.fetch(getServer() + "/api/system/exit", {method: "POST"});
-                bootWindow.destroy();
-                resolve(false);
-            } else {
-                let progressing = false;
-                while (!progressing) {
-                    try {
-                        const progressResult = await net.fetch(getServer() + "/api/system/bootProgress");
-                        const progressData = await progressResult.json();
-                        if (progressData.data.progress >= 100) {
-                            resolve(true);
-                            progressing = true;
-                        } else {
-                            await sleep(100);
-                        }
-                    } catch (e) {
-                        writeLog("get boot progress failed: " + e.message);
-                        net.fetch(getServer() + "/api/system/exit", {method: "POST"});
-                        bootWindow.destroy();
-                        resolve(false);
-                        progressing = true;
-                    }
-                }
-            }
-        } else {
-            writeLog(`get kernel version failed: ${apiData.code}, ${apiData.msg}`);
-            resolve(false);
-        }
-    });
-};
-
 app.setAsDefaultProtocolClient("siyuan");
 
 app.commandLine.appendSwitch("disable-web-security");
@@ -726,7 +681,6 @@ app.commandLine.appendSwitch("no-proxy-server");
 app.commandLine.appendSwitch("enable-features", "PlatformHEVCDecoderSupport");
 app.commandLine.appendSwitch("xdg-portal-required-version", "4");
 
-// Support set Chromium command line arguments on the desktop https://github.com/siyuan-note/siyuan/issues/9696
 writeLog("app is packaged [" + app.isPackaged + "], command line args [" + process.argv.join(", ") + "]");
 let argStart = 1;
 if (!app.isPackaged) {
@@ -736,7 +690,6 @@ if (!app.isPackaged) {
 for (let i = argStart; i < process.argv.length; i++) {
     let arg = process.argv[i];
     if (arg.startsWith("--workspace=") || arg.startsWith("--openAsHidden") || arg.startsWith("--port=") || arg.startsWith("siyuan://")) {
-        // 跳过内置参数
         if (arg.startsWith("--openAsHidden")) {
             openAsHidden = true;
             writeLog("open as hidden");
@@ -748,7 +701,39 @@ for (let i = argStart; i < process.argv.length; i++) {
     writeLog("command line switch [" + arg + "]");
 }
 
+// 注册IPC通信
+ipcMain.handle("test-remote-connection", async (event, config) => {
+    try {
+        const response = await net.fetch(`http://${config.host}:${config.port}/api/system/version`, {
+            method: "POST",
+            timeout: 5000
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP错误: ${response.status}`);
+        }
+        const data = await response.json();
+        if (data.code !== 0) {
+            throw new Error(data.msg || "获取版本失败");
+        }
+        return { version: data.data };
+    } catch (e) {
+        throw new Error(`无法连接到服务器: ${e.message}`);
+    }
+});
+
+ipcMain.handle("save-remote-config", async (event, config) => {
+    remoteServerConfig = {
+        host: config.host,
+        port: parseInt(config.port)
+    };
+    saveRemoteServerConfig();
+    return { success: true };
+});
+
 app.whenReady().then(() => {
+    // 加载远程服务器配置
+    loadRemoteServerConfig();
+
     const resetTrayMenu = (tray, lang, mainWindow) => {
         if (!mainWindow || mainWindow.isDestroyed()) {
             return;
@@ -758,6 +743,8 @@ app.whenReady().then(() => {
             label: mainWindow.isVisible() ? lang.hideWindow : lang.showWindow, click: () => {
                 showHideWindow(tray, lang, mainWindow);
             },
+        }, {
+            label: "配置远程服务器", click: () => createConfigWindow()
         }, {
             label: lang.officialWebsite, click: () => {
                 shell.openExternal("https://b3log.org/siyuan/");
@@ -778,8 +765,7 @@ app.whenReady().then(() => {
         },];
 
         if ("win32" === process.platform) {
-            // Windows 端支持窗口置顶 https://github.com/siyuan-note/siyuan/issues/6860
-            trayMenuTemplate.splice(1, 0, {
+            trayMenuTemplate.splice(2, 0, {
                 label: mainWindow.isAlwaysOnTop() ? lang.cancelWindowTop : lang.setWindowTop, click: () => {
                     if (!mainWindow.isAlwaysOnTop()) {
                         mainWindow.setAlwaysOnTop(true);
@@ -793,14 +779,14 @@ app.whenReady().then(() => {
         const contextMenu = Menu.buildFromTemplate(trayMenuTemplate);
         tray.setContextMenu(contextMenu);
     };
+    
     const hideWindow = (wnd) => {
-        // 通过 `Alt+M` 最小化后焦点回到先前的窗口 https://github.com/siyuan-note/siyuan/issues/7275
         wnd.minimize();
-        // Mac 隐藏后无法再 Dock 中显示
         if ("win32" === process.platform || "linux" === process.platform) {
             wnd.hide();
         }
     };
+    
     const showHideWindow = (tray, lang, mainWindow) => {
         if (!mainWindow || mainWindow.isDestroyed()) {
             return;
@@ -821,6 +807,7 @@ app.whenReady().then(() => {
     const getWindowByContentId = (id) => {
         return BrowserWindow.getAllWindows().find((win) => win.webContents.id === id);
     };
+    
     ipcMain.on("siyuan-context-menu", (event, langs) => {
         const template = [new MenuItem({
             role: "undo", label: langs.undo
@@ -842,9 +829,11 @@ app.whenReady().then(() => {
         const menu = Menu.buildFromTemplate(template);
         menu.popup({window: BrowserWindow.fromWebContents(event.sender)});
     });
+    
     ipcMain.on("siyuan-first-quit", () => {
         app.exit();
     });
+    
     ipcMain.handle("siyuan-get", (event, data) => {
         if (data.cmd === "showOpenDialog") {
             return dialog.showOpenDialog(data);
@@ -897,15 +886,7 @@ app.whenReady().then(() => {
                     return;
                 }
                 const ids = decodeURIComponent(url.hash.substring(1)).split("\u200b");
-                const options = JSON.parse(data.options);
-                if (ids.includes(options.rootID) || ids.includes(options.assetPath)) {
-                    item.focus();
-                    item.webContents.send("siyuan-open-file", options);
-                    hasMatch = true;
-                    return true;
-                }
             });
-            return hasMatch;
         }
     });
 
@@ -1182,58 +1163,7 @@ app.whenReady().then(() => {
             win.setBounds(targetScreen.workArea);
         }
     });
-    ipcMain.on("siyuan-open-workspace", (event, data) => {
-        const foundWorkspace = workspaces.find((item) => {
-            if (item.workspaceDir === data.workspace) {
-                showWindow(item.browserWindow);
-                return true;
-            }
-        });
-        if (!foundWorkspace) {
-            initKernel(data.workspace, "", "").then((isSucc) => {
-                if (isSucc) {
-                    initMainWindow();
-                }
-            });
-        }
-    });
-    ipcMain.handle("siyuan-init", async (event, data) => {
-        const exitWS = workspaces.find(item => {
-            if (event.sender.id === item.browserWindow.webContents.id && item.workspaceDir) {
-                if (item.tray && "win32" === process.platform || "linux" === process.platform) {
-                    // Tray menu text does not change with the appearance language https://github.com/siyuan-note/siyuan/issues/7935
-                    resetTrayMenu(item.tray, data.languages, item.browserWindow);
-                }
-                return true;
-            }
-        });
-        if (exitWS) {
-            return;
-        }
 
-        workspaces.find(item => {
-            if (!item.workspaceDir) {
-                item.workspaceDir = data.workspaceDir;
-                let tray;
-                if ("win32" === process.platform || "linux" === process.platform) {
-                    // 系统托盘
-                    tray = new Tray(path.join(appDir, "stage", "icon-large.png"));
-                    tray.setToolTip(`${path.basename(data.workspaceDir)} - SiYuan v${appVer}`);
-                    const mainWindow = getWindowByContentId(event.sender.id);
-                    if (!mainWindow || mainWindow.isDestroyed()) {
-                        return;
-                    }
-                    resetTrayMenu(tray, data.languages, mainWindow);
-                    tray.on("click", () => {
-                        showHideWindow(tray, data.languages, mainWindow);
-                    });
-                }
-                item.tray = tray;
-                return true;
-            }
-        });
-        await net.fetch(getServer(data.port) + "/api/system/uiproc?pid=" + process.pid, {method: "POST"});
-    });
     ipcMain.on("siyuan-hotkey", (event, data) => {
         if (!data.hotkeys || data.hotkeys.length === 0) {
             return;
@@ -1315,68 +1245,9 @@ app.whenReady().then(() => {
         });
     });
 
-    if (firstOpen) {
-        const firstOpenWindow = new BrowserWindow({
-            width: Math.floor(screen.getPrimaryDisplay().size.width * 0.6),
-            height: Math.floor(screen.getPrimaryDisplay().workAreaSize.height * 0.8),
-            frame: "darwin" === process.platform,
-            titleBarStyle: "hidden",
-            fullscreenable: false,
-            icon: path.join(appDir, "stage", "icon-large.png"),
-            transparent: "darwin" === process.platform,
-            webPreferences: {
-                nodeIntegration: true, webviewTag: true, webSecurity: false, contextIsolation: false,
-            },
-        });
-        let initHTMLPath = path.join(appDir, "app", "electron", "init.html");
-        if (isDevEnv) {
-            initHTMLPath = path.join(appDir, "electron", "init.html");
-        }
 
-        // 改进桌面端初始化时使用的外观语言 https://github.com/siyuan-note/siyuan/issues/6803
-        const languages = app.getPreferredSystemLanguages();
-        const language = resolveAppLanguage(languages);
-        firstOpenWindow.loadFile(initHTMLPath, {
-            query: {
-                lang: language,
-                home: app.getPath("home"),
-                v: appVer,
-                icon: path.join(appDir, "stage", "icon-large.png"),
-            },
-        });
-        firstOpenWindow.show();
-        // 初始化启动
-        ipcMain.on("siyuan-first-init", (event, data) => {
-            initKernel(data.workspace, "", data.lang).then((isSucc) => {
-                if (isSucc) {
-                    initMainWindow();
-                }
-            });
-            firstOpenWindow.destroy();
-        });
-    } else {
-        const getArg = (name) => {
-            for (let i = 0; i < process.argv.length; i++) {
-                if (process.argv[i].startsWith(name)) {
-                    return process.argv[i].split("=")[1];
-                }
-            }
-        };
-
-        const workspace = getArg("--workspace");
-        if (workspace) {
-            writeLog("got arg [--workspace=" + workspace + "]");
-        }
-        const port = getArg("--port");
-        if (port) {
-            writeLog("got arg [--port=" + port + "]");
-        }
-        initKernel(workspace, port, "").then((isSucc) => {
-            if (isSucc) {
-                initMainWindow();
-            }
-        });
-    }
+    // 初始化主窗口（不再启动内核）
+    initMainWindow();
 
     // 电源相关事件必须放在 whenReady 里面，否则会导致 Linux 端无法正常启动 Trace/breakpoint trap (core dumped) https://github.com/siyuan-note/siyuan/issues/9347
     powerMonitor.on("suspend", () => {
@@ -1427,106 +1298,19 @@ app.whenReady().then(() => {
     });
 });
 
-app.on("open-url", async (event, url) => { // for macOS
-    if (url.startsWith("siyuan://")) {
-        let isBackground = true;
-        if (workspaces.length === 0) {
-            isBackground = false;
-            let index = 0;
-            while (index < 10) {
-                index++;
-                await sleep(500);
-                if (workspaces.length > 0) {
-                    break;
-                }
-            }
-        }
-        if (!isBackground) {
-            await sleep(1500);
-        }
-        workspaces.forEach(item => {
-            if (item.browserWindow && !item.browserWindow.isDestroyed()) {
-                item.browserWindow.webContents.send("siyuan-open-url", url);
-            }
-        });
+// 处理多实例
+app.on('second-instance', (event, commandLine, workingDirectory) => {
+    // 当运行第二个实例时,聚焦到主窗口
+    const mainWindow = workspaces[0]?.browserWindow;
+    if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
     }
 });
 
-app.on("second-instance", (event, argv) => {
-    writeLog("second-instance [" + argv + "]");
-    let workspace = argv.find((arg) => arg.startsWith("--workspace="));
-    if (workspace) {
-        workspace = workspace.split("=")[1];
-        writeLog("got second-instance arg [--workspace=" + workspace + "]");
+// 关闭所有窗口时退出应用
+app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+        app.quit();
     }
-    let port = argv.find((arg) => arg.startsWith("--port="));
-    if (port) {
-        port = port.split("=")[1];
-        writeLog("got second-instance arg [--port=" + port + "]");
-    } else {
-        port = 0;
-    }
-    const foundWorkspace = workspaces.find(item => {
-        if (item.browserWindow && !item.browserWindow.isDestroyed()) {
-            if (workspace && workspace === item.workspaceDir) {
-                showWindow(item.browserWindow);
-                return true;
-            }
-        }
-    });
-    if (foundWorkspace) {
-        return;
-    }
-    if (workspace) {
-        initKernel(workspace, port, "").then((isSucc) => {
-            if (isSucc) {
-                initMainWindow();
-            }
-        });
-        return;
-    }
-
-    const siyuanURL = argv.find((arg) => arg.startsWith("siyuan://"));
-    workspaces.forEach(item => {
-        if (item.browserWindow && !item.browserWindow.isDestroyed() && siyuanURL) {
-            item.browserWindow.webContents.send("siyuan-open-url", siyuanURL);
-        }
-    });
-
-    if (!siyuanURL && 0 < workspaces.length) {
-        showWindow(workspaces[0].browserWindow);
-    }
-});
-
-app.on("activate", () => {
-    if (workspaces.length > 0) {
-        const mainWindow = (latestActiveWindow && !latestActiveWindow.isDestroyed()) ? latestActiveWindow : workspaces[0].browserWindow;
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.show();
-        }
-    }
-    if (BrowserWindow.getAllWindows().length === 0) {
-        initMainWindow();
-    }
-});
-
-app.on("web-contents-created", (webContentsCreatedEvent, contents) => {
-    contents.setWindowOpenHandler((details) => {
-        // https://github.com/siyuan-note/siyuan/issues/10567
-        if (details.url.startsWith("file:///") && details.disposition === "foreground-tab") {
-            return;
-        }
-        // 在编辑器内打开链接的处理，比如 iframe 上的打开链接。
-        shell.openExternal(details.url);
-        return {action: "deny"};
-    });
-});
-
-app.on("before-quit", (event) => {
-    workspaces.forEach(item => {
-        if (item.browserWindow && !item.browserWindow.isDestroyed()) {
-            event.preventDefault();
-            item.browserWindow.webContents.send("siyuan-save-close", true);
-        }
-    });
 });
