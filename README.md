@@ -30,6 +30,12 @@
 
 ---
 
+#### 官方地址 [siyuan-note/siyuan](https://github.com/siyuan-note/siyuan)
+#### win7版electron [e3kskoy7wqk/Electron-for-windows-7](https://github.com/e3kskoy7wqk/Electron-for-windows-7)
+#### win7版golang [XTLS/go-win7](https://github.com/XTLS/go-win7)
+
+---
+
 ## Table of Contents
 
 * [💡 Introduction](#-introduction)
